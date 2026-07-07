@@ -1,4 +1,4 @@
-export function Name() { return "Nollie"; } 
+export function Name() { return "Nollie"; }
 export function VendorId() { return 0x16D1; }
 export function ProductId() { return 0x1612; }
 export function Publisher() { return "Nollie"; } 
@@ -6,9 +6,15 @@ export function Size() { return [1, 1]; }
 export function DefaultPosition(){return [0, 0];}
 export function DefaultScale(){return 1.0;}
 export function Type() { return "Hid"; }
-export function SupportsSubdevices(){ return true; } 
+export function SubdeviceController(){ return true; }
 
-export function ControllableParameters() 
+/* global
+shutdownColor:readonly
+LightingMode:readonly
+Channelnumber:readonly
+forcedColor:readonly
+*/
+export function ControllableParameters()
 {
 	return [
 		{"property":"shutdownColor", "label":"Shutdown Color", "min":"0", "max":"360", "type":"color", "default":"000000"},
@@ -19,7 +25,7 @@ export function ControllableParameters()
 }
 
 const DeviceMaxLedLimit = 480;
-let ChannelArray = 
+const ChannelArray =
 [
 	["Channel 1", 100],
 	["Channel 2", 100],
@@ -60,95 +66,119 @@ export function LedPositions()
 	return vKeyPositions;
 }
 
-export function Initialize() 
+function SendInitPacket()
 {
 	let packet = new Array(65).fill(0);
 	packet[2] = 0x01;
 	device.write(packet, 65);
-	SetupChannels();
 }
 
-export function Render() 
+export function Initialize()
+{
+	SetupChannels();
+	SendInitPacket();
+}
+
+// Channelnumber is a UI-bound ControllableParameter (combobox, "1".."8").
+// The packet header for every single channel/packet uses Number(Channelnumber)
+// every frame. If that global ever reads back as something that doesn't parse
+// to 1-8 (empty/undefined/anything else) - for whatever reason, at whatever
+// moment - every packet's header goes bad at once, which would explain a
+// total, all-channel freeze with no exception and no write error: the
+// firmware would just be rejecting/ignoring malformed headers while
+// device.write() itself keeps "succeeding". Cache the last known-good value
+// instead of trusting the live global every frame, so a single bad read
+// can't take every channel down.
+let lastGoodChannelnumber = 8;
+
+function GetChannelnumber()
+{
+	const n = Number(Channelnumber);
+	if(Number.isInteger(n) && n >= 1 && n <= 8)
+	{
+		lastGoodChannelnumber = n;
+	}
+	return lastGoodChannelnumber;
+}
+
+export function Render()
 {
 	for(let i = 0; i < ChannelArray.length; i++)
 	{
-		
 		SendChannel(i);
 	}
 
 	device.pause(1);
 }
 
-export function Shutdown() 
+export function Shutdown(SystemSuspending)
 {
+	const overrideColor = SystemSuspending ? "#000000" : shutdownColor;
+
 	for(let i = 0; i < ChannelArray.length; i++)
 	{
-		SendChannel(i, true);
-	}
-	for(let i = 0; i < ChannelArray.length; i++)
-	{
-		SendChannel(i, true);
+		SendChannel(i, overrideColor);
 	}
 
-
-    
-	let RGBData = [];
-	RGBData = device.createColorArray(shutdownColor, 1, "Inline");	
-	let packet = [0x00,0xff, RGBData[0],RGBData[1],RGBData[2]];
+	const RGBData = device.createColorArray(overrideColor, 1, "Inline");
+	const packet = [0x00, 0xff, RGBData[0], RGBData[1], RGBData[2]];
 	device.write(packet, 65);
 	device.pause(1);
 }
 
-function SendChannel(Channel, shutdown = false) 
+function SendChannel(Channel, overrideColor)
 {
+	// The firmware needs a packet for every one of the 8 channels every
+	// single frame to treat the frame as complete and actually update the
+	// display - confirmed by direct hardware testing: cycling 7 of 8
+	// channels (skipping one with no component assigned) leaves the
+	// device permanently showing stale colors even though every write
+	// still reports success; including all 8, even with an empty payload
+	// for an unpopulated channel, fixes it immediately. So this always
+	// sends at least one packet per channel, never returns early.
+	const componentChannel = device.channel(ChannelArray[Channel][0]);
 
-	let ChannelLedCount = device.channel(ChannelArray[Channel][0]).ledCount > ChannelArray[Channel][1] ? ChannelArray[Channel][1] : device.channel(ChannelArray[Channel][0]).ledCount;
-	let componentChannel = device.channel(ChannelArray[Channel][0]); 
-
-	
+	let ChannelLedCount = 0;
 	let RGBData = [];
 
-	if(shutdown)
+	if(componentChannel)
 	{
+		ChannelLedCount = componentChannel.ledCount > ChannelArray[Channel][1] ? ChannelArray[Channel][1] : componentChannel.ledCount;
 
-		RGBData = device.createColorArray(shutdownColor, ChannelLedCount, "Inline");
-		
-	}
-	else if(LightingMode === "Forced") 
-	{
-		
-		RGBData = device.createColorArray(forcedColor, ChannelLedCount, "Inline");
-	}
-	else if(componentChannel.shouldPulseColors()) 
-	{
-		ChannelLedCount = 90;
-		
-		let pulseColor = device.getChannelPulseColor(ChannelArray[Channel][0], ChannelLedCount);
-		RGBData = device.createColorArray(pulseColor, ChannelLedCount, "Inline");
-	}
-	else
-	{
-		
-		RGBData = device.channel(ChannelArray[Channel][0]).getColors("Inline");
-		
-		
+		if(overrideColor)
+		{
+			RGBData = device.createColorArray(overrideColor, ChannelLedCount, "Inline");
+		}
+		else if(LightingMode === "Forced")
+		{
+			RGBData = device.createColorArray(forcedColor, ChannelLedCount, "Inline");
+		}
+		else if(componentChannel.shouldPulseColors())
+		{
+			ChannelLedCount = 90;
+
+			const pulseColor = device.getChannelPulseColor(ChannelArray[Channel][0]);
+			RGBData = device.createColorArray(pulseColor, ChannelLedCount, "Inline");
+		}
+		else
+		{
+			RGBData = componentChannel.getColors("Inline");
+		}
 	}
 
-	let NumPackets = Math.ceil(ChannelLedCount / MaxLedsInPacket); 
- 	
+	const NumPackets = Math.max(1, Math.ceil(ChannelLedCount / MaxLedsInPacket));
+
 	for(let CurrPacket = 1; CurrPacket <= NumPackets; CurrPacket++)
 	{
-		let packet = [0x00, CurrPacket,Number(Channelnumber), NumPackets, Channel + 1];
-
+		const packet = [0x00, CurrPacket, GetChannelnumber(), NumPackets, Channel + 1];
 		packet.push(...RGBData.splice(0, 60));
-
 		device.write(packet, 65);
 	}
 }
 
 export function Validate(endpoint)
 {
-	return endpoint.interface === 2;
+	return endpoint.interface === 2 && endpoint.usage === 0x0001 && endpoint.usage_page === 0xFF00 && endpoint.collection === 0x0000;
 }
 
 export function Image()
